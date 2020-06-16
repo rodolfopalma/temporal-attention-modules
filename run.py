@@ -2,7 +2,6 @@ import argparse
 import time
 import os
 
-from comet_ml import Experiment
 
 import torch
 import torch.nn as nn
@@ -99,6 +98,15 @@ parser.add_argument(
 parser.add_argument(
     "--task_threshold", default=0.05, type=float,
     help="Error threshold required to complete a task.")
+parser.add_argument(
+    "--comet_logging", default=False, type=bool,
+    help="Log experiment to Comet.ml")
+parser.add_argument(
+    "--teach_force_answer_training", default=False, action="store_true",
+    help="Teach force the answer during post hoc module training.")
+parser.add_argument(
+    "--teach_force_answer_evaluation", default=False, action="store_true",
+    help="Teach force the answer during post hoc module evaluation.")
 
 # Model parameters
 parser.add_argument(
@@ -117,20 +125,14 @@ parser.add_argument(
     "--temporal_activation", default="softmax", choices=("sigmoid", "softmax"),
     help="Which function should the model activate the temporal alignments.")
 parser.add_argument(
+    "--temporal_attention", default="additive", choices=("additive", "multiplicative"),
+    help="Which temporal attention should the model use.")
+parser.add_argument(
     "--output_module", default="joint", choices=("joint", "parallel"),
     help="Which output module should the model use.")
-
-# Comet parameters
 parser.add_argument(
-    "--comet_api_key",
-    help="API key to use for Comet.ml")
-parser.add_argument(
-    "--comet_project_name", default="thesis", type=str,
-    help="Project name to use for Comet.ml")
-parser.add_argument(
-    "--comet_workspace", default="rpalma", type=str,
-    help="Workspace to use for Comet.ml")
-
+    "--temporal_attention_module", default="prehoc", choices=("prehoc", "posthoc"),
+    help="Which temporal attention module should the model use.")
 
 def run(args):
     # Print the args
@@ -233,12 +235,14 @@ def run_cycle(
     ):
 
     # Comet
-    experiment = Experiment(
-        api_key=args.comet_api_key,
-        project_name=args.comet_project_name,
-        workspace=args.comet_workspace)
-    experiment.log_parameters(vars(args))
-    experiment.log_other("run_id", run_id)
+    if args.comet_logging:
+        from comet_ml import Experiment
+        experiment = Experiment(
+            api_key="GKIWhJ0lS0N674H48YQVMVNgV",
+            project_name="thesis",
+            workspace="rpalma")
+        experiment.log_parameters(vars(args))
+        experiment.log_other("run_id", run_id)
 
     # Build the model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -254,7 +258,9 @@ def run_cycle(
         output_inner_size=args.output_inner_size,
         temporal_attention_to_sentence=args.temporal_attention_to_sentence,
         temporal_activation=args.temporal_activation,
+        temporal_attention=args.temporal_attention,
         dropout_prob=args.dropout_prob,
+        temporal_attention_module=args.temporal_attention_module,
         device=device)
     entnet.to(device)
     print("Trainable parameters:", sum(p.numel() for p in entnet.parameters() if p.requires_grad), "\n")
@@ -292,6 +298,7 @@ def run_cycle(
             dataloader,
             should_train,
             should_teach_force,
+            should_teach_force_answer,
             summaries_writer,
             experiment,
             experiment_context,
@@ -316,7 +323,8 @@ def run_cycle(
                 story,
                 story_mask,
                 query,
-                supporting_facts=supp_facts_target if should_teach_force else None)
+                supporting_facts=supp_facts_target if should_teach_force else None,
+                answers=qa_target if should_teach_force_answer else None)
             qa_loss = qa_criterion(qa_predicted, qa_target)
             supp_facts_loss = supp_facts_criterion(supp_facts_alignment, supp_facts_target)
             loss = args.qa_lambda * qa_loss + args.supporting_facts_lambda * supp_facts_loss
@@ -356,16 +364,17 @@ def run_cycle(
             entnet.named_parameters(),
             summaries_writer, epoch)
         
-        with experiment_context():
-            metrics = {
-                "loss": mean_loss,
-                "qa_loss": mean_qa_loss,
-                "supp_facts_loss": mean_supp_facts_loss,
-                "qa_accuracy": mean_qa_accuracy,
-                "supp_facts_f1": mean_supp_facts_f1
-            }
-            experiment.log_metrics(metrics, step=epoch)
-            experiment.log_epoch_end(args.epochs, step=epoch)
+        if experiment is not None:
+            with experiment_context():
+                metrics = {
+                    "loss": mean_loss,
+                    "qa_loss": mean_qa_loss,
+                    "supp_facts_loss": mean_supp_facts_loss,
+                    "qa_accuracy": mean_qa_accuracy,
+                    "supp_facts_f1": mean_supp_facts_f1
+                }
+                experiment.log_metrics(metrics, step=epoch)
+                experiment.log_epoch_end(args.epochs, step=epoch)
 
         return mean_loss, mean_qa_loss, mean_supp_facts_loss, mean_qa_accuracy, mean_supp_facts_f1
     
@@ -377,9 +386,10 @@ def run_cycle(
             train_dataloader,
             should_train=True,
             should_teach_force=args.teach_force_training,
+            should_teach_force_answer=args.teach_force_answer_training,
             summaries_writer=train_writer,
-            experiment=experiment,
-            experiment_context=experiment.train,
+            experiment=experiment if args.comet_logging else None,
+            experiment_context=experiment.train if args.comet_logging else None,
             epoch=epoch,
             quiet=False)
         print("Epoch = %d.%d; task_id = %d\n\ttrain QA accuracy = %.5f; train QA error = %.5f; train supp. facts F1 = %.5f; train loss = %.5f; train QA loss = %.5f; train supp. facts loss = %.5f" % (
@@ -391,9 +401,10 @@ def run_cycle(
                 validation_dataloader,
                 should_train=False,
                 should_teach_force=args.teach_force_evaluation,
+                should_teach_force_answer=args.teach_force_answer_evaluation,
                 summaries_writer=val_writer,
-                experiment=experiment,
-                experiment_context=experiment.validate,
+                experiment=experiment if args.comet_logging else None,
+                experiment_context=experiment.validate if args.comet_logging else None,
                 epoch=epoch,
                 quiet=True)
         print("\tval QA accuracy = %.5f;  val QA error = %.5f;  val loss = %.8f;  val F1 = %.8f" % (val_accuracy, 1 - val_accuracy, val_loss, val_f1), "\n")
@@ -413,9 +424,10 @@ def run_cycle(
             test_dataloader,
             should_train=False,
             should_teach_force=args.teach_force_evaluation,
+            should_teach_force_answer=args.teach_force_answer_evaluation,
             summaries_writer=test_writer,
-            experiment=experiment,
-            experiment_context=experiment.test,
+            experiment=experiment if args.comet_logging else None,
+            experiment_context=experiment.test if args.comet_logging else None,
             epoch=best_epoch,
             quiet=False)
     print("Epoch = %d.%d\n\ttest accuracy = %.5f;  test error = %.5f;  test loss = %.8f;  test F1 = %.8f" % (run_id, best_epoch, test_accuracy, 1 - test_accuracy, test_loss, test_f1), "\n")

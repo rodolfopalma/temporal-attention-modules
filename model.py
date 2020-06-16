@@ -20,13 +20,17 @@ class EntityNetwork(nn.Module):
             output_inner_size,
             temporal_attention_to_sentence,
             temporal_activation,
+            temporal_attention,
+            temporal_attention_module,
             device,
             dropout_prob=0
         ):
         super().__init__()
         # Sanity check
         assert output_module in ("joint", "parallel")
+        assert temporal_attention_module in ("prehoc", "posthoc")
         self.temporal_attention_to_sentence = temporal_attention_to_sentence
+        self.temporal_attention_module = temporal_attention_module
         self.embeddings_table = nn.Embedding( # [vocab_sz, embeddings_sz]
             num_embeddings=vocab_size + n_blocks,
             embedding_dim=embeddings_size,
@@ -55,21 +59,27 @@ class EntityNetwork(nn.Module):
             "queries_length": queries_length,
             "temporal_attention_to_sentence": temporal_attention_to_sentence,
             "temporal_activation": temporal_activation,
+            "temporal_attention": temporal_attention,
+            "temporal_attention_module": temporal_attention_module,
             "device": device,
             "prelu": self.prelu
         }
-        if output_module == "joint":
-            self.output_module = _JointOutputModule(**output_kwargs)
-        elif output_module == "parallel":
-            self.output_module = _ParallelOutputModule(**output_kwargs)
+        if temporal_attention_module == "prehoc":
+            if output_module == "joint":
+                self.output_module = _JointOutputModule(**output_kwargs)
+            elif output_module == "parallel":
+                self.output_module = _ParallelOutputModule(**output_kwargs)
+        elif temporal_attention_module == "posthoc":
+            self.output_module = _PostHocOutputModule(**output_kwargs)
 
-    def forward(self, stories, stories_mask, queries, supporting_facts=None):
+    def forward(self, stories, stories_mask, queries, supporting_facts=None, answers=None):
         """
         Args:
             - stories: a 3-D tensor with shape [batch_sz, stories_len, sentence_len].
             - stories_mask: a 2-D tensor with shape [batch_sz, stories_len].
             - queries: a 2-D tensor with shape [batch_sz, queries_len].
             - supporting_facts: a 2-D tensor with shape [batch_sz, stories_len].
+            - answers: a 1-D tensor with shape [batch_sz].
         Returns:
             - answers: a 2-D tensor with shape [batch_sz, answers_vocab_size].
             - attended: a 2-D tensor with shape [batch_sz, stories_len].
@@ -85,7 +95,8 @@ class EntityNetwork(nn.Module):
             queries=queries,
             stories_mask=stories_mask,
             stories=stories_reduced if self.temporal_attention_to_sentence else None,
-            supporting_facts=supporting_facts)
+            supporting_facts=supporting_facts,
+            answers=answers)
         return answers, alignment, attention
 
 
@@ -225,6 +236,8 @@ class _OutputModule(nn.Module):
             queries_length,
             temporal_attention_to_sentence,
             temporal_activation,
+            temporal_attention,
+            temporal_attention_module,
             device,
             prelu,
             initializer=NORMAL_INITIALIZER,
@@ -238,31 +251,42 @@ class _OutputModule(nn.Module):
         self.temporal_attention_to_sentence = temporal_attention_to_sentence
         assert temporal_activation in ("sigmoid", "softmax")
         self.temporal_activation = temporal_activation
+        assert temporal_attention in ("additive", "multiplicative")
+        self.temporal_attention = temporal_attention
+        assert temporal_attention_module in ("prehoc", "posthoc")
+        self.temporal_attention_module = temporal_attention_module
         self.prelu = prelu
 
         self.multiplicative_mask = nn.Parameter(torch.Tensor(queries_length, embeddings_size))
         mask_initializer(self.multiplicative_mask)
-        self.A = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
-        initializer(self.A)
-        self.B = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
-        initializer(self.B)
-        self.C = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
-        initializer(self.C)
-        self.v = nn.Parameter(torch.Tensor(inner_size))
-        mask_initializer(self.v) # Initialize it with ones!
-        # self.b_1 = nn.Parameter(torch.Tensor(20))
-        # initializer(self.b_1)
-        self.D = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
-        initializer(self.D)
-        if temporal_attention_to_sentence:
-            self.E = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
-            initializer(self.E)
-        self.F = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
-        initializer(self.F)
-        self.w = nn.Parameter(torch.Tensor(inner_size))
-        mask_initializer(self.w)
-        # self.b_2 = nn.Parameter(torch.Tensor(10))
-        # initializer(self.b_2)
+        if temporal_attention == "additive":
+            self.A = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
+            initializer(self.A)
+            self.B = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
+            initializer(self.B)
+            C_F_in_multipliers = {
+                "prehoc": 1,
+                "posthoc": 2
+            }
+            C_F_in_multiplier = C_F_in_multipliers[temporal_attention_module]
+            self.C = nn.Parameter(torch.Tensor(C_F_in_multiplier * embeddings_size, inner_size))
+            initializer(self.C)
+            self.F = nn.Parameter(torch.Tensor(C_F_in_multiplier * embeddings_size, inner_size))
+            initializer(self.F)
+
+            self.v = nn.Parameter(torch.Tensor(inner_size))
+            mask_initializer(self.v) # Initialize it with ones!
+            # self.b_1 = nn.Parameter(torch.Tensor(20))
+            # initializer(self.b_1)
+            self.D = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
+            initializer(self.D)
+            if temporal_attention_to_sentence:
+                self.E = nn.Parameter(torch.Tensor(embeddings_size, inner_size))
+                initializer(self.E)
+            self.w = nn.Parameter(torch.Tensor(inner_size))
+            mask_initializer(self.w)
+            # self.b_2 = nn.Parameter(torch.Tensor(10))
+            # initializer(self.b_2)
         self.H = nn.Parameter(torch.Tensor(embeddings_size, embeddings_size))
         initializer(self.H)
         self.R = nn.Parameter(torch.Tensor(embeddings_size, answers_vocab_size))
@@ -287,17 +311,27 @@ class _OutputModule(nn.Module):
             - stories: a tensor with shape [batch_sz, story_len, embeddings_sz].
         """
         # Intratemporal attention
-        intratemporal_alignment_A = torch.matmul( # [batch_sz, story_len, n_blocks, inner_sz]
-            memories, self.A)
-        # batch_size, story_length, _, _ = intratemporal_alignment_A.size()
         keys_embedded = self.embeddings_table(keys)
-        intratemporal_alignment_B = torch.matmul( # [n_blocks, inner_sz] -> [1, 1, n_blocks, inner_sz]
-            keys_embedded, self.B).unsqueeze(0).unsqueeze(0)
-        intratemporal_alignment_C = torch.matmul( # [batch_sz, inner_sz] -> [batch_sz, 1, 1, inner_sz]
-            queries, self.C).unsqueeze(1).unsqueeze(1)
-        intratemporal_alignment = torch.sum( # [batch_sz, story_len, n_blocks]
-            self.v * torch.tanh(intratemporal_alignment_A + intratemporal_alignment_B + intratemporal_alignment_C),
-            dim=3)
+        if self.temporal_attention == "additive":
+            intratemporal_alignment_A = torch.matmul( # [batch_sz, story_len, n_blocks, inner_sz]
+                memories, self.A)
+            # batch_size, story_length, _, _ = intratemporal_alignment_A.size()
+            intratemporal_alignment_B = torch.matmul( # [n_blocks, inner_sz] -> [1, 1, n_blocks, inner_sz]
+                keys_embedded, self.B).unsqueeze(0).unsqueeze(0)
+            intratemporal_alignment_C = torch.matmul( # [batch_sz, inner_sz] -> [batch_sz, 1, 1, inner_sz]
+                queries, self.C).unsqueeze(1).unsqueeze(1)
+            intratemporal_alignment = torch.sum( # [batch_sz, story_len, n_blocks]
+                self.v * torch.tanh(intratemporal_alignment_A + intratemporal_alignment_B + intratemporal_alignment_C),
+                dim=3)
+        elif self.temporal_attention == "multiplicative":
+            queries_unsqueezed = queries.unsqueeze(1).unsqueeze(1) # [batch_sz, 1, 1, embeddings_sz]
+            intratemporal_alignment_h = torch.sum( # [batch_sz, story_len, n_blocks]
+                memories * queries_unsqueezed,
+                dim=3)
+            intratemporal_alignment_w = torch.sum( # [batch_sz, story_len, n_blocks]
+                keys_embedded * queries_unsqueezed,
+                dim=3)
+            intratemporal_alignment = intratemporal_alignment_h + intratemporal_alignment_w
         intratemporal_attention = nn.functional.softmax( # [batch_sz, story_len, n_blocks] -> [batch_sz, story_len, n_blocks, 1]
             intratemporal_alignment, dim=2).unsqueeze(3)
 
@@ -306,15 +340,21 @@ class _OutputModule(nn.Module):
             intratemporal_attention * memories, dim=2)
 
         # Temporal attention
-        temporal_alignment_D = torch.matmul( # [batch_sz, story_len, inner_sz]
-            temporal_memory, self.D)
-        temporal_alignment_E = torch.matmul(  # [batch_sz, story_len, inner_sz]
-            stories, self.E) if self.temporal_attention_to_sentence else 0
-        temporal_alignment_F = torch.matmul( # [batch_sz, inner_sz] -> [batch_sz, 1, inner_sz]
-            queries, self.F).unsqueeze(1)
-        temporal_alignment_unmasked = torch.sum( # [batch_sz, story_len]
-            self.w * torch.tanh(temporal_alignment_D + temporal_alignment_E + temporal_alignment_F),
-            dim=2)
+        if self.temporal_attention == "additive":
+            temporal_alignment_D = torch.matmul( # [batch_sz, story_len, inner_sz]
+                temporal_memory, self.D)
+            temporal_alignment_E = torch.matmul(  # [batch_sz, story_len, inner_sz]
+                stories, self.E) if self.temporal_attention_to_sentence else 0
+            temporal_alignment_F = torch.matmul( # [batch_sz, inner_sz] -> [batch_sz, 1, inner_sz]
+                queries, self.F).unsqueeze(1)
+            temporal_alignment_unmasked = torch.sum( # [batch_sz, story_len]
+                self.w * torch.tanh(temporal_alignment_D + temporal_alignment_E + temporal_alignment_F),
+                dim=2)
+        elif self.temporal_attention == "multiplicative":
+            queries_unsqueezed = queries.unsqueeze(1) # [batch_sz, 1, embeddings_sz]
+            temporal_alignment_unmasked = torch.sum( # [batch_sz, story_len]
+                temporal_memory * queries_unsqueezed,
+                dim=2)
         temporal_alignment = torch.mul(temporal_alignment_unmasked, stories_mask)
 
         if self.temporal_activation == "sigmoid":
@@ -375,7 +415,7 @@ class _ParallelOutputModule(_OutputModule):
 
 
 class _JointOutputModule(_OutputModule):
-    def forward(self, keys, memories, queries, stories_mask, stories=None, supporting_facts=None):
+    def forward(self, keys, memories, queries, stories_mask, stories=None, supporting_facts=None, **kwargs):
         """
         Args:
             - keys: a tensor with shape [n_blocks].
@@ -415,3 +455,52 @@ class _JointOutputModule(_OutputModule):
             queries_reduced + torch.matmul(u, self.H))
         answers = torch.matmul(inner_y, self.R)
         return answers, temporal_alignment, temporal_attention
+
+
+class _PostHocOutputModule(_OutputModule):
+    def forward(self, keys, memories, queries, stories_mask, stories=None, answers=None, **kwargs):
+        """
+        Args:
+            - keys: a tensor with shape [n_blocks].
+            - memories: a tensor with shape [batch_sz, story_len, n_blocks, block_sz].
+            - queries: a tensor with shape [batch_sz, queries_len].
+            - stories_mask: a tensor with shape [batch_sz, stories_len].
+            - stories: a tensor with shape [batch_sz, story_len, embeddings_sz].
+            - answers: a tensor with shape [batch_sz].
+        Returns:
+            - answers: a tensor with shape [batch_sz, answers_vocab_sz].
+            - temporal_alignment: a tensor with shape [batch_sz, story_len].
+            - temporal_attention: a tensor with shape [batch_sz, story_len].
+        """
+        # Embed query
+        queries_reduced = self._reduce_query(queries) # [batch_sz, embeddings_sz]
+        queries_unsqueezed = torch.unsqueeze( # [batch_sz, 1, embeddings_sz]
+            queries_reduced, dim=1)
+
+        last_memories = memories[:, -1, :, :]
+        alignment = torch.sum( # [batch_sz, n_blocks]
+            queries_unsqueezed * last_memories, dim=2)
+        p = nn.functional.softmax( # [batch_sz, n_blocks]
+            alignment, dim=1)
+        p_unsqueezed = torch.unsqueeze( # [batch_sz, n_blocks, 1]
+            p, dim=2)
+        u = torch.sum( # [batch_sz, embeddings_sz]
+            p_unsqueezed * last_memories, dim=1)
+
+        inner_y = self.prelu( # [batch_sz, embeddings_sz]
+            queries_reduced + torch.matmul(u, self.H))
+        inferred_answers = torch.matmul(inner_y, self.R) # [batch_sz, vocab_sz]
+        if answers is None:
+            answers = inferred_answers.argmax(dim=1)
+        answer_embedding = self.embeddings_table(answers) # [batch_sz, embeddings_sz]
+        query_answer_combined = torch.cat([queries_reduced, answer_embedding], dim=1) # [batch_sz, 2 * embeddings_sz]
+
+        # Temporal attention
+        temporal_attention, temporal_alignment, _ = self._get_temporal_attention(
+            memories,
+            keys,
+            query_answer_combined,
+            stories_mask,
+            stories)
+
+        return inferred_answers, temporal_alignment, temporal_attention
