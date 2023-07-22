@@ -1,4 +1,4 @@
-future==0.18.2
+future==0.18.3
 joblib==0.15.1
 numpy==1.18.5
 protobuf==3.12.2
